@@ -1,0 +1,1256 @@
+Directory structure:
+└── news_reporter/
+    ├── llm_call.py
+    ├── main.py
+    ├── news_reporter.zip
+    ├── rss_state.json
+    ├── config/
+    │   └── feeds_config.py
+    ├── core/
+    │   ├── helpers.py
+    │   ├── helpers_for_lambda.py
+    │   ├── relevance_analyzer.py
+    │   ├── rss_fetcher.py
+    │   └── send_email.py
+    └── feeds/
+        ├── arstechnica_feed.py
+        ├── engadget_feed.py
+        ├── geekwire_feed.py
+        ├── haberturk_feed.py
+        ├── techcrunch_feed.py
+        ├── theverge_feed.py
+        └── wired_feed.py
+
+================================================
+FILE: llm_call.py
+================================================
+import os
+import asyncio
+import time
+import random
+from typing import List, Dict, Union
+from openai import OpenAI, AsyncOpenAI
+
+# NEW: instructor + pydantic for structured outputs
+import instructor
+from pydantic import BaseModel
+
+# Retry constants
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 2  # seconds
+
+
+# NEW: Structured output model (exactly two fields)
+class Evaluation(BaseModel):
+    score: int          # e.g., 1..10
+    reasoning: str      # free-form explanation
+
+async def chat_completion_async(
+    chat_history: List[Dict[str, str]],
+    temperature: float = 0.5,
+    use_structured: bool = False,  # If True, return Evaluation(score:int, reasoning:str)
+) -> Union[str, "Evaluation"]:
+    """
+    Async LLM chat completion helper using openai/gpt-5-mini with retries.
+    If use_structured=True, returns an Evaluation via instructor JSON schema enforcement.
+    """
+
+    base_url = os.getenv("LLM_BASE_URL")
+    api_key = os.getenv("LLM_API_KEY")
+
+    if not base_url:
+        raise AttributeError("LLM_BASE_URL environment variable not set.")
+    if not api_key:
+        raise AttributeError("LLM_API_KEY environment variable not set.")
+
+    # Create async OpenAI client
+    client: AsyncOpenAI | instructor.Client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url.rstrip('/'),
+    )
+
+    # If structured mode is requested, patch client for JSON schema enforcement
+    if use_structured:
+        client = instructor.from_openai(client, mode=instructor.Mode.JSON)
+
+    model_name = "openai/gpt-5-mini"
+
+    request_params: Dict = {
+        "model": model_name,
+        "messages": chat_history.copy(),
+        "temperature": temperature,
+        "max_tokens": 1024,
+    }
+
+    # In structured mode, instruct the client to parse into our Evaluation model
+    if use_structured:
+        request_params["response_model"] = Evaluation  # type: ignore[name-defined]
+
+    last_exception: Exception | None = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            # IMPORTANT: await the async create call
+            response = await client.chat.completions.create(**request_params)
+
+            # In structured mode, response is already an Evaluation instance
+            if use_structured:
+                return response  # type: ignore[return-value]
+
+            # Non-structured: return raw text
+            return response.choices[0].message.content  # type: ignore[union-attr]
+
+        except Exception as e:
+            last_exception = e
+            attempt_num = attempt + 1
+            print(f"Error during chat completion on attempt {attempt_num}/{MAX_RETRIES}: {e}")
+
+            if attempt < MAX_RETRIES - 1:
+                # Exponential backoff with jitter
+                delay = (RETRY_DELAY_SECONDS * (2 ** attempt)) + random.uniform(0, 0.5)
+                print(f"Retrying in {delay:.2f} seconds...")
+                await asyncio.sleep(delay)
+            else:
+                print(f"All {MAX_RETRIES} retry attempts failed for model {model_name}.")
+                raise e
+
+    # Should never reach here
+    raise RuntimeError(f"Chat completion failed unexpectedly. Last error: {last_exception}")
+
+
+# def chat_completion(
+#     chat_history: List[Dict[str, str]],
+#     temperature: float = 0.5,
+#     use_structured: bool = False,  # NEW: toggle structured output
+# ) -> Union[str, Evaluation]:
+#     """
+#     Simple LLM chat completion helper using openai/gpt-5-mini with retries.
+#     If use_structured=True, returns an Evaluation(score:int, reasoning:str)
+#     using the instructor package to enforce the schema.
+#     """
+
+#     load_dotenv()
+
+#     base_url = os.getenv("LLM_BASE_URL")
+#     api_key = os.getenv("LLM_API_KEY")
+
+#     if not base_url:
+#         raise AttributeError("LLM_BASE_URL environment variable not set.")
+#     if not api_key:
+#         raise AttributeError("LLM_API_KEY environment variable not set.")
+
+#     # Create OpenAI client
+#     client = OpenAI(api_key=api_key, base_url=base_url.rstrip('/'))
+
+#     # If structured mode is requested, patch client for JSON schema enforcement
+#     if use_structured:
+#         client = instructor.from_openai(client, mode=instructor.Mode.JSON)
+
+#     model_name = "openai/gpt-5-mini"
+
+#     request_params = {
+#         "model": model_name,
+#         "messages": chat_history.copy(),
+#         "temperature": temperature,
+#         "max_tokens": 1024,
+#     }
+
+#     # In structured mode, instruct the client to parse into our Evaluation model
+#     if use_structured:
+#         request_params["response_model"] = Evaluation
+
+#     last_exception = None
+#     for attempt in range(MAX_RETRIES):
+#         try:
+#             response = client.chat.completions.create(**request_params)
+
+#             # In structured mode, response is already an Evaluation instance
+#             if use_structured:
+#                 return response  # type: Evaluation
+
+#             # In non-structured mode, keep original string behavior
+#             return response.choices[0].message.content
+
+#         except Exception as e:
+#             last_exception = e
+#             print(f"Error during chat completion on attempt {attempt + 1}/{MAX_RETRIES}: {e}")
+#             if attempt < MAX_RETRIES - 1:
+#                 print(f"Retrying in {RETRY_DELAY_SECONDS} seconds...")
+#                 time.sleep(RETRY_DELAY_SECONDS)
+#             else:
+#                 print(f"All {MAX_RETRIES} retry attempts failed for model {model_name}.")
+#                 raise e
+
+#     raise RuntimeError("Chat completion failed unexpectedly.")
+
+
+async def main():
+    # Example usage (structured output with score + reasoning)
+    structured_prompt = [
+        {"role": "system", "content": "You evaluate relevance. Respond ONLY with a score (integer) and reasoning (text)."},
+        {"role": "user", "content": (
+            "Give a point about its relevance to the Israel-Palestine conflict. "
+            "1 to 10. 1 being irrelevant 10 being very much relevant.\n\n"
+            "TEXT:\nABD Başkanı Trump, İsrail'in ateşkesi ihlal ederek Gazze'ye düzenlediği saldırıların Gazze'deki ateşkesi tehlikeye atmayacağını ifade etti. Söz konusu ateşkesi 'çok büyük bir barış' olarak niteleyen Trump, Hamas'ın silah bırakmaya başladığını çünkü ateşkesin ikinci aşamasına girildiğini söyledi"
+        )},
+    ]
+
+    print("\nCalling openai/gpt-5-mini (structured output)...")
+    structured = await chat_completion_async(chat_history=structured_prompt, use_structured=True)
+    # If structured is a Pydantic model (Evaluation), you can access fields like this:
+    try:
+        print("\nResponse (structured Evaluation):")
+        print("score:", structured.score)
+        print("reasoning:", structured.reasoning)
+    except AttributeError:
+        # If your structured client returns a dict-like object
+        print("\nResponse (structured Evaluation):", structured)
+
+    # # Non-structured example:
+    # plain_prompt = [
+    #     {"role": "system", "content": "You are a helpful assistant."},
+    #     {"role": "user", "content": "Say hello briefly."},
+    # ]
+    # print("\nCalling openai/gpt-5-mini (plain text)...")
+    # text = await chat_completion_async(chat_history=plain_prompt, use_structured=False)
+    # print("\nResponse (text):", text)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+================================================
+FILE: main.py
+================================================
+import os
+import asyncio
+import aiohttp
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+import traceback  # Import traceback to get detailed error information
+
+from config.feeds_config import FEEDS
+from core.helpers import load_last_run_time, save_last_run_time, extract_score_reason
+from core.rss_fetcher import fetch_feed_content
+from core.relevance_analyzer import analyze_relevance_async
+from core.send_email import send_email
+
+LLM_CONCURRENCY = 32
+
+async def process_feed(feed, session, sem, email_cfg):
+    """
+    Process a single feed, sending an email on failure and always updating the timestamp.
+    """
+    name = feed["name"]
+    start_time = datetime.now(timezone.utc)  # Consistent timestamp for this run
+
+    try:
+        urls = feed["urls"]
+        postprocess_fn = feed["postprocess_fn"]
+
+        print(f"\n📡 Processing feed: {name}")
+
+        last_run = load_last_run_time(name)
+        if last_run:
+            print(f"Last run for {name}: {last_run.strftime('%a, %d %b %Y %H:%M:%S GMT')}")
+        else:
+            print(f"First run for {name} (no previous timestamp found)")
+
+        # --- Fetch raw feed content ---
+        fetch_tasks = [fetch_feed_content(session, url) for url in urls]
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        # print(results)
+        # raise Exception("Debug Exception: Inspect fetched results")  # Debugging line
+
+        # --- Postprocess: parse and standardize feed content ---
+        processed_items = []
+        for res in results:
+            if isinstance(res, Exception):
+                print(f"❌ Fetch error in {name}: {res}")
+                continue
+            try:
+                items = postprocess_fn(res)  # feed-specific parser
+                processed_items.extend(items)
+            except Exception as e:
+                print(f"❌ Postprocessing error for {name}: {e}")
+
+        # --- Filter new items ---
+        new_items = [
+            it for it in processed_items
+            if it["pub_date"] is not None
+            and (last_run is None or it["pub_date"] > last_run)
+        ]
+        new_items.sort(key=lambda x: x["pub_date"], reverse=True)
+
+        if not new_items:
+            print(f"No new items in {name}.")
+            return
+
+        print(f"🆕 {len(new_items)} new items from {name}")
+
+        # --- Analyze relevance (feed-specific prompt) ---
+        base_prompt = feed.get("llm_prompt")
+
+        llm_tasks = [
+            analyze_relevance_async(it["description"], sem, base_prompt)
+            for it in new_items
+        ]
+        llm_results = await asyncio.gather(*llm_tasks, return_exceptions=True)
+
+        relevant_items_for_email = []
+        for item, result in zip(new_items, llm_results):
+            if isinstance(result, Exception):
+                print(f"Error analyzing {item['title']}: {result}")
+                continue
+
+            score, reason = extract_score_reason(result)
+            #print(score, reason)
+            if score and score > 5:
+                print(f"✅ Relevant: {item['title']} ({score})")
+                relevant_items_for_email.append((item, score, reason))
+
+        # --- Send email for relevant items ---
+        if relevant_items_for_email:
+            body_lines = [f"Found {len(relevant_items_for_email)} relevant articles in {name}:\n"]
+            for item, score, reason in relevant_items_for_email:
+                body_lines.append("---")
+                body_lines.append(f"Title: {item['title']}")
+                body_lines.append(f"Link: {item['link']}")
+                body_lines.append(f"Relevance Score: {score}")
+                body_lines.append(f"Reasoning: {reason}\n")
+
+            try:
+                send_email(
+                    subject=f"AI News Alert: {name}",
+                    body="\n".join(body_lines),
+                    **email_cfg,
+                )
+            except Exception as e:
+                print(f"❌ Email failed for {name}: {e}")
+
+    except Exception as e:
+        # If any part of the process fails, log it and send an email alert.
+        print(f"❌ CRITICAL ERROR processing feed '{name}': {e}")
+        error_details = traceback.format_exc()
+        print(error_details)
+        try:
+            send_email(
+                subject=f"CRITICAL ERROR in News Reporter: Failed to process '{name}'",
+                body=f"The news reporter failed to process the '{name}' feed.\n\nError:\n{error_details}",
+                **email_cfg,
+            )
+        except Exception as mail_e:
+            print(f"❌ Additionally, failed to send error email: {mail_e}")
+
+    finally:
+        # --- Always save the last run time to prevent reprocessing a failing feed ---
+        save_last_run_time(name, start_time)
+        print(f"✅ Updated last run time for {name} to {start_time.strftime('%a, %d %b %Y %H:%M:%S GMT')}\n")
+
+
+async def main():
+    load_dotenv()
+
+    email_cfg = {
+        "to_emails": [e.strip() for e in os.getenv("TO_EMAILS", "").split(",") if e.strip()],
+        "email_user": os.getenv("EMAIL_USER"),
+        "email_pass": os.getenv("EMAIL_PASS"),
+        "smtp_server": os.getenv("SMTP_SERVER", "smtp.gmail.com"),
+        "smtp_port": int(os.getenv("SMTP_PORT", 587)),
+    }
+
+    sem = asyncio.Semaphore(LLM_CONCURRENCY)
+
+    async with aiohttp.ClientSession() as session:
+        for feed in FEEDS:
+            await process_feed(feed, session, sem, email_cfg)
+
+
+# Use this for local use
+if __name__ == "__main__":
+   asyncio.run(main())
+
+# # Use this (uncomment) for AWS Lambda
+# def lambda_handler(event, context):
+#     asyncio.run(main())
+
+
+
+================================================
+FILE: news_reporter.zip
+================================================
+[Binary file]
+
+
+================================================
+FILE: rss_state.json
+================================================
+{
+  "Haberturk": "Mon, 03 Nov 2025 08:51:33 GMT",
+  "Tech Crunch": "Mon, 03 Nov 2025 08:51:33 GMT",
+  "Wired": "Mon, 03 Nov 2025 08:51:33 GMT",
+  "Ars Technica": "Mon, 03 Nov 2025 08:51:34 GMT",
+  "GeekWire": "Mon, 03 Nov 2025 08:51:34 GMT",
+  "The Verge": "Mon, 03 Nov 2025 08:51:35 GMT",
+  "Engadget": "Mon, 03 Nov 2025 08:51:35 GMT"
+}
+
+
+================================================
+FILE: config/feeds_config.py
+================================================
+from feeds.haberturk_feed import haberturk_postprocess
+from feeds.techcrunch_feed import techcrunch_postprocess
+from feeds.wired_feed import wired_postprocess
+from feeds.arstechnica_feed import arstechnica_postprocess
+from feeds.geekwire_feed import geekwire_postprocess
+from feeds.theverge_feed import theverge_postprocess
+from feeds.engadget_feed import engadget_postprocess
+
+FEEDS = [
+    {
+        "name": "Haberturk",
+        "urls": [
+            "https://www.haberturk.com/rss/manset.xml",
+            "https://www.haberturk.com/rss/ekonomi.xml",
+        ],
+        "postprocess_fn": haberturk_postprocess,
+        "llm_prompt": (
+            "Determine if this Turkish news article concerns an improvement or advancement in Turkey’s military capabilities — such as the introduction of new weapons, technologies like aircraft, drones, or defense systems. Focus only on concrete, measurable military developments, not political statements or rhetoric."
+            "Score from 1–10, where 10 is highly related to AI."
+        ),
+    },
+    {
+        "name": "Tech Crunch",
+        "urls": ["https://techcrunch.com/feed/"],
+        "postprocess_fn": techcrunch_postprocess,
+        "llm_prompt": (
+            "Assess how strongly this article discusses a partnership, collaboration, or any type of relationship —positive or negative— between multiple companies."
+            "Score 0–10 with a brief reasoning."
+        ),
+    },
+    {
+        "name": "Wired",
+        "urls": [
+            "https://www.wired.com/feed/category/business/latest/rss",
+            "https://www.wired.com/feed/tag/ai/latest/rss",
+        ],
+        "postprocess_fn": wired_postprocess,
+        "llm_prompt": (
+            "Assess how strongly this article discusses a partnership, collaboration, or any type of relationship —positive or negative— between multiple companies."
+            "Give a score (0–10) and short reasoning."
+        ),
+    },
+    {
+        "name": "Ars Technica",
+        "urls": ["https://feeds.arstechnica.com/arstechnica/index"],
+        "postprocess_fn": arstechnica_postprocess,
+        "llm_prompt": (
+            "Assess how strongly this article discusses a partnership, collaboration, or any type of relationship —positive or negative— between multiple companies."
+            "Score 0–10 with reasoning."
+        ),
+    },
+    {
+        "name": "GeekWire",
+        "urls": ["https://www.geekwire.com/feed/"],
+        "postprocess_fn": geekwire_postprocess,
+        "llm_prompt": (
+            "Assess how strongly this article discusses a partnership, collaboration, or any type of relationship —positive or negative— between multiple companies."
+            "Give a 0–10 relevance score."
+        ),
+    },
+
+    {
+        "name": "The Verge",
+        "urls": ["https://www.theverge.com/rss/index.xml"],
+        "postprocess_fn": theverge_postprocess,
+        "llm_prompt": (
+            "Assess how strongly this article discusses a partnership, collaboration, or any type of relationship —positive or negative— between multiple companies."
+            "Score 0–10 with concise reasoning."
+        ),
+    },
+
+    {
+        "name": "Engadget",
+        "urls": ["https://www.engadget.com/rss.xml"],
+        "postprocess_fn": engadget_postprocess,
+        "llm_prompt": (
+            "Assess how strongly this article discusses a partnership, collaboration, or any type of relationship —positive or negative— between multiple companies."
+            "Score 0–10 with concise reasoning."
+        ),
+    },
+]
+
+
+
+================================================
+FILE: core/helpers.py
+================================================
+import os
+import json
+from datetime import datetime, timezone
+from typing import Optional, Dict
+
+STATE_FILE = "rss_state.json"
+
+
+# ====== State Management ======
+
+def _load_state() -> Dict[str, str]:
+    """Load the entire RSS state JSON (feed name -> timestamp)."""
+    if not os.path.exists(STATE_FILE):
+        return {}
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def _save_state(data: Dict[str, str]) -> None:
+    """Save the entire RSS state JSON."""
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_last_run_time(feed_name: str) -> Optional[datetime]:
+    """Load last run time for a specific feed."""
+    data = _load_state()
+    gmt_str = data.get(feed_name)
+    if not gmt_str:
+        return None
+    try:
+        return datetime.strptime(gmt_str, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def save_last_run_time(feed_name: str, dt: datetime) -> None:
+    """Save last run time for a specific feed."""
+    data = _load_state()
+    gmt_str = dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    data[feed_name] = gmt_str
+    _save_state(data)
+
+
+# ====== Relevance Helper ======
+
+def extract_score_reason(result):
+    """Extract score (int) and reasoning (str) from an LLM structured output."""
+    if hasattr(result, "score"):
+        try:
+            return int(result.score), getattr(result, "reasoning", "")
+        except Exception:
+            return None, getattr(result, "reasoning", "")
+    try:
+        score = result.get("score")  # type: ignore
+        reason = result.get("reasoning")  # type: ignore
+        return int(score) if score is not None else None, reason
+    except Exception:
+        return None, None
+
+
+
+================================================
+FILE: core/helpers_for_lambda.py
+================================================
+# Use this for AWS Lambda!
+
+import os
+import json
+from datetime import datetime, timezone
+from typing import Optional, Dict
+import boto3
+from botocore.exceptions import ClientError
+
+# ====== Configuration ======
+BUCKET_NAME = "news-analyzer-timelog"
+STATE_FILE_KEY = "rss_state.json"
+LOCAL_FALLBACK_PATH = "/tmp/rss_state.json"
+
+s3 = boto3.client("s3")
+
+
+# ====== State Management ======
+
+def _load_state() -> Dict[str, str]:
+    """Load the entire RSS state JSON (feed name -> timestamp) from S3 or fallback."""
+    # Try loading from S3
+    try:
+        response = s3.get_object(Bucket=BUCKET_NAME, Key=STATE_FILE_KEY)
+        content = response["Body"].read().decode("utf-8")
+        data = json.loads(content)
+        print(f"[INFO] Loaded state from s3://{BUCKET_NAME}/{STATE_FILE_KEY}")
+        return data
+    except s3.exceptions.NoSuchKey:
+        print("[INFO] State file not found in S3 — starting fresh.")
+        return {}
+    except ClientError as e:
+        print(f"[WARN] Could not load state from S3: {e}")
+
+    # Fallback to local /tmp if available
+    if os.path.exists(LOCAL_FALLBACK_PATH):
+        try:
+            with open(LOCAL_FALLBACK_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[WARN] Failed to load fallback state: {e}")
+
+    return {}
+
+
+def _save_state(data: Dict[str, str]) -> None:
+    """Save the entire RSS state JSON to S3 (with local /tmp fallback)."""
+    json_data = json.dumps(data, ensure_ascii=False, indent=2)
+
+    # Try saving to S3
+    try:
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=STATE_FILE_KEY,
+            Body=json_data.encode("utf-8"),
+            ContentType="application/json"
+        )
+        print(f"[INFO] Saved state to s3://{BUCKET_NAME}/{STATE_FILE_KEY}")
+        return
+    except ClientError as e:
+        print(f"[ERROR] Failed to save state to S3: {e}")
+
+    # Fallback to /tmp
+    try:
+        with open(LOCAL_FALLBACK_PATH, "w", encoding="utf-8") as f:
+            f.write(json_data)
+        print(f"[INFO] Saved fallback state to {LOCAL_FALLBACK_PATH}")
+    except Exception as err:
+        print(f"[ERROR] Could not save fallback state: {err}")
+
+
+def load_last_run_time(feed_name: str) -> Optional[datetime]:
+    """Load last run time for a specific feed."""
+    data = _load_state()
+    gmt_str = data.get(feed_name)
+    if not gmt_str:
+        return None
+    try:
+        return datetime.strptime(gmt_str, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def save_last_run_time(feed_name: str, dt: datetime) -> None:
+    """Save last run time for a specific feed."""
+    data = _load_state()
+    gmt_str = dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    data[feed_name] = gmt_str
+    _save_state(data)
+
+
+# ====== Relevance Helper ======
+
+def extract_score_reason(result):
+    """Extract score (int) and reasoning (str) from an LLM structured output."""
+    if hasattr(result, "score"):
+        try:
+            return int(result.score), getattr(result, "reasoning", "")
+        except Exception:
+            return None, getattr(result, "reasoning", "")
+    try:
+        score = result.get("score")  # type: ignore
+        reason = result.get("reasoning")  # type: ignore
+        return int(score) if score is not None else None, reason
+    except Exception:
+        return None, None
+
+
+
+================================================
+FILE: core/relevance_analyzer.py
+================================================
+# core/relevance_analyzer.py
+import asyncio
+from llm_call import chat_completion_async
+
+async def analyze_relevance_async(description: str, sem: asyncio.Semaphore, base_prompt: str):
+    """
+    Analyze relevance of a feed item using the provided LLM prompt.
+    Each feed can have its own unique base_prompt.
+    """
+    question = f"{base_prompt}\n\nTEXT:\n{description}"
+
+    chat_history = [
+        {
+            "role": "system",
+            "content": "You are a precise and concise news analyst. Output must conform to the schema: score (integer), reasoning (text).",
+        },
+        {"role": "user", "content": question},
+    ]
+
+    async with sem:
+        return await chat_completion_async(
+            chat_history=chat_history, temperature=0.2, use_structured=True
+        )
+
+
+
+================================================
+FILE: core/rss_fetcher.py
+================================================
+import aiohttp
+
+async def fetch_feed_content(session: aiohttp.ClientSession, url: str) -> bytes:
+    """
+    Fetch raw feed content from the given URL.
+    Makes absolutely no assumptions about format, tags, or structure.
+    It could be RSS, Atom, JSON Feed, or custom XML/HTML.
+    """
+    print(f"Fetching: {url}")
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        resp.raise_for_status()
+        return await resp.read()
+
+
+
+================================================
+FILE: core/send_email.py
+================================================
+import os
+import smtplib
+from email.message import EmailMessage
+from dotenv import load_dotenv
+
+def send_email(subject, body, to_emails, email_user, email_pass, smtp_server, smtp_port):
+    if not all([email_user, email_pass, to_emails]):
+        raise ValueError("Missing email credentials or recipient list.")
+
+    msg = EmailMessage()
+    msg["From"] = email_user
+    msg["To"] = ", ".join(to_emails)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(email_user, email_pass)
+            server.send_message(msg)
+            print("✅ Email sent successfully!")
+    except Exception as e:
+        print(f"❌ Failed to send email: {e}")
+
+
+
+================================================
+FILE: feeds/arstechnica_feed.py
+================================================
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+import html
+import re
+
+def arstechnica_postprocess(raw_bytes):
+    """
+    Parse and standardize an Ars Technica RSS feed.
+    Input: raw XML bytes
+    Output: list of standardized dicts ready for model input.
+    """
+
+    def normalize_text(text: str) -> str:
+        """Decode HTML entities, fix punctuation, and normalize whitespace."""
+        text = html.unescape(text or "")
+        text = text.strip()
+        text = text.replace("\u2013", "-").replace("\u2014", "-")
+        text = text.replace("\u2018", "'").replace("\u2019", "'")
+        text = text.replace("\u201c", '"').replace("\u201d", '"')
+        text = text.replace("\xa0", " ")
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    # --- Parse XML ---
+    root = ET.fromstring(raw_bytes)
+    items = []
+
+    # Ars Technica uses standard <item> tags
+    for node in root.findall(".//item"):
+        title = normalize_text(node.findtext("title", ""))
+        link = (node.findtext("link") or "").strip()
+        description = normalize_text(node.findtext("description", ""))
+        pub_date_str = (node.findtext("pubDate") or "").strip()
+
+        # --- Parse and normalize publication date ---
+        parsed = None
+        for fmt in [
+            "%a, %d %b %Y %H:%M:%S %Z",  # e.g. Fri, 31 Oct 2025 18:23:09 GMT
+            "%a, %d %b %Y %H:%M:%S %z",  # e.g. Fri, 31 Oct 2025 18:23:09 +0000
+        ]:
+            try:
+                parsed = datetime.strptime(pub_date_str, fmt)
+                break
+            except Exception:
+                continue
+
+        if parsed:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+
+        items.append({
+            "title": title,
+            "link": link,
+            "description": description,
+            "pub_date": parsed,
+            "pub_date_str": pub_date_str,
+        })
+
+    return items
+
+
+
+================================================
+FILE: feeds/engadget_feed.py
+================================================
+# feeds/engadget_feed.py
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+import re
+import html
+import email.utils
+
+
+def engadget_postprocess(raw_bytes):
+    """
+    Parse and standardize an Engadget RSS feed.
+    Input: raw XML bytes
+    Output: list of standardized dicts with keys:
+        title, link, description, pub_date, pub_date_str, image
+    """
+
+    def clean_html(raw_html: str) -> str:
+        """Strip tags and decode entities."""
+        if not raw_html:
+            return ""
+        cleaned = re.sub(r"<iframe[^>]*>.*?</iframe>", " ", raw_html, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<core-commerce[^>]*>.*?</core-commerce>", " ", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)  # remove any remaining tags
+        cleaned = html.unescape(cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
+    def normalize_text(text: str) -> str:
+        """Normalize smart punctuation and whitespace."""
+        text = html.unescape(text or "")
+        text = text.strip()
+        text = text.replace("\u2013", "-").replace("\u2014", "-")
+        text = text.replace("\u2018", "'").replace("\u2019", "'")
+        text = text.replace("\u201c", '"').replace("\u201d", '"')
+        text = text.replace("\xa0", " ")
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    # --- Parse XML ---
+    xml_str = raw_bytes.decode("utf-8", errors="ignore")
+    root = ET.fromstring(xml_str)
+    items = []
+
+    # Engadget uses standard RSS 2.0 <item> tags
+    for node in root.findall(".//item"):
+        title = normalize_text(node.findtext("title", ""))
+        link = (node.findtext("link") or "").strip()
+        description = clean_html(node.findtext("description", ""))
+        pub_date_str = (node.findtext("pubDate") or "").strip()
+
+        # --- Parse publication date robustly ---
+        pub_date = None
+        if pub_date_str:
+            try:
+                pub_date = email.utils.parsedate_to_datetime(pub_date_str)
+                if pub_date.tzinfo is None:
+                    pub_date = pub_date.replace(tzinfo=timezone.utc)
+                else:
+                    pub_date = pub_date.astimezone(timezone.utc)
+            except Exception:
+                for fmt in [
+                    "%a, %d %b %Y %H:%M:%S %z",
+                    "%a, %d %b %Y %H:%M:%S %Z",
+                ]:
+                    try:
+                        pub_date = datetime.strptime(pub_date_str, fmt)
+                        if pub_date.tzinfo is None:
+                            pub_date = pub_date.replace(tzinfo=timezone.utc)
+                        else:
+                            pub_date = pub_date.astimezone(timezone.utc)
+                        break
+                    except Exception:
+                        continue
+
+        # --- Extract media image (if any) ---
+        image_url = ""
+        for media_tag in node.findall(".//{http://search.yahoo.com/mrss/}content"):
+            url = media_tag.attrib.get("url")
+            if url and url.strip():
+                image_url = url.strip()
+                break
+
+        items.append({
+            "title": title,
+            "link": link,
+            "description": description,
+            "pub_date": pub_date,
+            "pub_date_str": pub_date_str,
+            "image": image_url,
+        })
+
+    return items
+
+
+
+================================================
+FILE: feeds/geekwire_feed.py
+================================================
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+import re
+import html
+
+def geekwire_postprocess(raw_bytes):
+    """
+    Parse and standardize a GeekWire RSS feed.
+    Input: raw XML bytes
+    Output: list of standardized dicts with title, link, description, pub_date, pub_date_str
+    """
+
+    def clean_html(raw_html: str) -> str:
+        """Strip HTML tags, images, and decode entities."""
+        if not raw_html:
+            return ""
+        cleaned = re.sub(r"<img[^>]*>", " ", raw_html, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</?a[^>]*>", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<br\s*/?>", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = html.unescape(cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
+    # --- Parse XML ---
+    root = ET.fromstring(raw_bytes)
+    items = []
+
+    # GeekWire uses standard RSS 2.0 <item> tags
+    for node in root.findall(".//item"):
+        title = html.unescape((node.findtext("title") or "").strip())
+        description = clean_html(node.findtext("description", ""))
+        link = (node.findtext("link") or "").strip()
+        pub_date_str = (node.findtext("pubDate") or "").strip()
+
+        # --- Parse date ---
+        parsed = None
+        for fmt in [
+            "%a, %d %b %Y %H:%M:%S %z",
+            "%a, %d %b %Y %H:%M:%S %Z",
+        ]:
+            try:
+                parsed = datetime.strptime(pub_date_str, fmt)
+                break
+            except Exception:
+                continue
+
+        if parsed:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+
+        items.append({
+            "title": title,
+            "link": link,
+            "description": description,
+            "pub_date": parsed,
+            "pub_date_str": pub_date_str,
+        })
+
+    return items
+
+
+
+================================================
+FILE: feeds/haberturk_feed.py
+================================================
+import xml.etree.ElementTree as ET
+from html import unescape
+from datetime import datetime, timezone
+import email.utils
+
+def haberturk_postprocess(xml_bytes):
+    """Parse Haberturk RSS feed (manset, ekonomi, etc.) and normalize entries."""
+    xml_str = xml_bytes.decode("utf-8", errors="ignore")
+    root = ET.fromstring(xml_str)
+
+    channel = root.find("channel") or root
+    entries = channel.findall("item")
+    if not entries:
+        # fallback: detect most frequent child tag
+        children = list(channel)
+        tag_counts = {}
+        for c in children:
+            tag_counts[c.tag] = tag_counts.get(c.tag, 0) + 1
+        if tag_counts:
+            top_tag = max(tag_counts.items(), key=lambda x: x[1])[0]
+            entries = channel.findall(top_tag)
+
+    results = []
+    for e in entries:
+        def get_text(*names):
+            for n in names:
+                node = e.find(n)
+                if node is not None and node.text:
+                    return node.text.strip()
+            return ""
+
+        title = unescape(get_text("title", "headline", "name"))
+        link = get_text("link", "url", "guid")
+        desc = unescape(get_text("description", "summary", "content", "subtitle"))
+        pub_date_str = get_text("pubDate", "published", "updated", "date")
+
+        # --- Parse pub_date robustly ---
+        pub_date = None
+        if pub_date_str:
+            pub_date_str = pub_date_str.strip().replace("\xa0", " ")
+            try:
+                pub_date = email.utils.parsedate_to_datetime(pub_date_str)
+                if pub_date and pub_date.tzinfo is None:
+                    pub_date = pub_date.replace(tzinfo=timezone.utc)
+                elif pub_date:
+                    pub_date = pub_date.astimezone(timezone.utc)
+            except Exception:
+                try:
+                    # Handle "+03:00" or "+0300" manually if needed
+                    fixed = pub_date_str.replace(" +03:00", " +0300")
+                    pub_date = datetime.strptime(fixed, "%a, %d %b %Y %H:%M:%S %z").astimezone(timezone.utc)
+                except Exception:
+                    pub_date = None
+
+        # --- Extract image ---
+        img = ""
+        for t in [
+            "image",
+            "{http://search.yahoo.com/mrss/}content",
+            "{http://search.yahoo.com/mrss/}thumbnail",
+            "enclosure",
+        ]:
+            node = e.find(t)
+            if node is not None:
+                img = node.attrib.get("url") or (node.text or "").strip()
+                if img:
+                    break
+
+        results.append({
+            "title": title,
+            "link": link,
+            "description": desc,
+            "pub_date_str": pub_date_str,
+            "pub_date": pub_date,
+            "image": img,
+        })
+
+    return results
+
+
+
+================================================
+FILE: feeds/techcrunch_feed.py
+================================================
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+def techcrunch_postprocess(raw_bytes):
+    """
+    Parse and standardize the TechCrunch RSS feed.
+    Input: raw XML bytes
+    Output: list of standardized dicts with title, link, description, pub_date, pub_date_str
+    """
+    root = ET.fromstring(raw_bytes)
+    items = []
+
+    # TechCrunch uses standard RSS 2.0 <item> elements
+    for node in root.findall(".//item"):
+        title = (node.findtext("title") or "").strip()
+        link = (node.findtext("link") or "").strip()
+        description = (node.findtext("description") or "").strip()
+        pub_date_str = (node.findtext("pubDate") or "").strip()
+
+        # Parse pub_date
+        parsed = None
+        for fmt in [
+            "%a, %d %b %Y %H:%M:%S %z",
+            "%a, %d %b %Y %H:%M:%S %Z",
+        ]:
+            try:
+                parsed = datetime.strptime(pub_date_str, fmt)
+                break
+            except Exception:
+                continue
+        if parsed:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+
+        items.append({
+            "title": title,
+            "link": link,
+            "description": description,
+            "pub_date": parsed,
+            "pub_date_str": pub_date_str,
+        })
+
+    return items
+
+
+
+================================================
+FILE: feeds/theverge_feed.py
+================================================
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+import re
+
+def theverge_postprocess(raw_bytes):
+    """
+    Parse and standardize The Verge Atom feed.
+    Input: raw XML bytes
+    Output: list of standardized dicts with keys:
+        title, link, author, summary, pub_date, pub_date_str
+    """
+
+    def normalize_text(text: str) -> str:
+        """Clean up smart quotes, unicode dashes, etc."""
+        text = (text or "").strip()
+        text = text.replace("\u2013", "-").replace("\u2014", "-")
+        text = text.replace("\u2018", "'").replace("\u2019", "'")
+        text = text.replace("\u201c", '"').replace("\u201d", '"')
+        text = text.replace("\xa0", " ")
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    # Parse XML and detect Atom namespace if present
+    root = ET.fromstring(raw_bytes)
+    ns = {}
+    if root.tag.startswith("{"):
+        ns_uri = root.tag.split("}")[0].strip("{")
+        ns["a"] = ns_uri  # Atom namespace alias
+
+    items = []
+
+    # Iterate over all <entry> nodes (Atom equivalent of <item>)
+    for entry in root.findall(".//a:entry", ns) or root.findall(".//entry"):
+        title = normalize_text(entry.findtext("a:title", default="", namespaces=ns))
+        if not title:
+            title = normalize_text(entry.findtext("title", default=""))
+
+        # <link> in Atom may have attributes instead of text content
+        link = ""
+        link_el = entry.find("a:link", ns) or entry.find("link")
+        if link_el is not None:
+            link = link_el.attrib.get("href", "").strip()
+
+        author_el = entry.find("a:author/a:name", ns) or entry.find("author/name")
+        author = normalize_text(author_el.text if author_el is not None else "")
+
+        summary = normalize_text(entry.findtext("a:summary", default="", namespaces=ns))
+        if not summary:
+            summary = normalize_text(entry.findtext("summary", default=""))
+
+        # Prefer <published>, fallback to <updated>
+        pub_date_str = (
+            entry.findtext("a:published", default="", namespaces=ns)
+            or entry.findtext("a:updated", default="", namespaces=ns)
+            or entry.findtext("published", default="")
+            or entry.findtext("updated", default="")
+        ).strip()
+
+        parsed = None
+        if pub_date_str:
+            try:
+                parsed = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
+                parsed = parsed.astimezone(timezone.utc)
+            except Exception:
+                parsed = None
+
+        items.append({
+            "title": title,
+            "link": link,
+            "author": author,
+            "description": summary,
+            "pub_date": parsed,
+            "pub_date_str": pub_date_str,
+        })
+
+    return items
+
+
+
+================================================
+FILE: feeds/wired_feed.py
+================================================
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+import re
+
+def wired_postprocess(raw_bytes):
+    """
+    Parse and standardize a WIRED RSS feed.
+    Input: raw XML bytes
+    Output: list of standardized dicts with title, link, description, pub_date, pub_date_str.
+    """
+
+    def normalize_text(text: str) -> str:
+        """Normalize smart punctuation and whitespace."""
+        text = (text or "").strip()
+        text = text.replace("\u2013", "-").replace("\u2014", "-")
+        text = text.replace("\u2018", "'").replace("\u2019", "'")
+        text = text.replace("\u201c", '"').replace("\u201d", '"')
+        text = text.replace("\xa0", " ")  # remove non-breaking spaces
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    # --- Parse XML ---
+    root = ET.fromstring(raw_bytes)
+    items = []
+
+    # WIRED uses standard RSS 2.0 <item> tags
+    for node in root.findall(".//item"):
+        title = normalize_text(node.findtext("title", ""))
+        link = (node.findtext("link") or "").strip()
+        description = normalize_text(node.findtext("description", ""))
+        pub_date_str = (node.findtext("pubDate") or "").strip()
+
+        # --- Parse publication date ---
+        parsed = None
+        for fmt in [
+            "%a, %d %b %Y %H:%M:%S %Z",  # e.g. Fri, 31 Oct 2025 18:34:14 GMT
+            "%a, %d %b %Y %H:%M:%S %z",  # e.g. Fri, 31 Oct 2025 18:34:14 +0000
+        ]:
+            try:
+                parsed = datetime.strptime(pub_date_str, fmt)
+                break
+            except Exception:
+                continue
+
+        if parsed:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+
+        items.append({
+            "title": title,
+            "link": link,
+            "description": description,
+            "pub_date": parsed,
+            "pub_date_str": pub_date_str,
+        })
+
+    return items
+
+
